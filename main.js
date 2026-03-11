@@ -1,4 +1,6 @@
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { CONFIG } from './Config.js';
 import { Fighter, FighterState } from './Fighter.js';
 import { InputManager } from './InputManager.js';
@@ -26,11 +28,25 @@ class Game {
         this.totalRounds = 4;
         this.currentRound = 1;
         this.roundWins = { p1: 0, p2: 0 };
+        this.roundTransitionActive = false;
+        this.roundEndPlaybackMs = 1300;
         this.rotationDebugEnabled = false;
+        this.isPaused = false;
+        this.musicVolume = 1;
+        this.sfxVolume = 1;
+        this.bgAudio = null;
+        this.bgAudioUnlocked = false;
+        this.cinematicAttack = null;
         this.shakeTimer = 0;
         this.shakeIntensity = 0.18;
         this.impactParticles = [];
         this.shockwaves = [];
+        this.fireballs = [];
+        this.previousFighterDeltaX = null;
+        this.jumpOverDelayCooldown = 0;
+        this.sideSwapGraceTimer = 0;
+        this.aiDifficultyLevels = ['EASY', 'NORMAL', 'HARD', 'EXPERT', 'VETERAN'];
+        this.aiDifficultyIndex = 1;
         this.hitAudio = {
             thud: new Audio('assets/thud.mp3'),
             crunch: new Audio('assets/bone-crunch.mp3'),
@@ -41,9 +57,13 @@ class Game {
         this.hitAudio.crunch.volume = 0.6;
         this.hitAudio.kickA.volume = 0.85;
         this.hitAudio.kickB.volume = 0.85;
+        this.initBackgroundAudio();
         
         // Character Selection State
         this.isSelecting = true;
+        this.gameMode = 'multiplayer';
+        this.selectionFocus = 'mode';
+        this.aiSelectStage = 'p1';
         this.p1Index = 0;
         this.p2Index = 0;
         this.p1Ready = false;
@@ -53,11 +73,112 @@ class Game {
         this.initEnvironment();
         
         this.ui = new UI();
+        this.ui.setSelectionActions({
+            onToggleMode: () => {
+                if (!this.isSelecting) return;
+                this.gameMode = this.gameMode === 'ai' ? 'multiplayer' : 'ai';
+                this.aiSelectStage = 'p1';
+                this.selectionFocus = 'mode';
+                this.input.applySelectionModeRules();
+            },
+            onAdjustAIDifficulty: (delta) => {
+                if (!this.isSelecting || this.gameMode !== 'ai') return;
+                this.adjustAIDifficulty(delta);
+                this.selectionFocus = 'difficulty';
+            },
+            onSetAIDifficulty: (index) => {
+                if (!this.isSelecting || this.gameMode !== 'ai') return;
+                this.setAIDifficulty(index);
+                this.selectionFocus = 'difficulty';
+            },
+            onPickCharacter: (player, index) => {
+                if (!this.isSelecting) return;
+                if (this.gameMode === 'ai') {
+                    if (this.aiSelectStage === 'p1') {
+                        if (player !== 'p1') return;
+                        this.p1Index = index;
+                        this.p1Ready = false;
+                        return;
+                    }
+
+                    if (this.aiSelectStage === 'p2') {
+                        if (player !== 'p2') return;
+                        this.p2Index = index;
+                        this.p2Ready = false;
+                        return;
+                    }
+                }
+
+                if (player === 'p1') {
+                    this.p1Index = index;
+                    this.p1Ready = false;
+                    if (this.gameMode === 'ai' && this.p2Index === this.p1Index) {
+                        this.p2Index = (this.p1Index + 1) % CONFIG.ASSETS.CHARACTERS.length;
+                    }
+                    return;
+                }
+
+                if (this.gameMode === 'ai') return;
+                this.p2Index = index;
+                this.p2Ready = false;
+            }
+        });
         this.ui.setGameOverActions(() => this.resetMatch(), () => this.quitToSelection());
+        this.ui.setPauseActions({
+            onResume: () => this.togglePause(false),
+            onRestart: () => {
+                this.togglePause(false);
+                this.resetMatch();
+            },
+            onQuit: () => {
+                this.togglePause(false);
+                this.quitToSelection();
+            },
+            onMusic: (v) => this.setMusicVolume(v),
+            onSfx: (v) => this.setSfxVolume(v),
+            onAdjustAIDifficulty: (delta) => {
+                if (this.gameMode !== 'ai') return;
+                this.adjustAIDifficulty(delta);
+            },
+            onSetAIDifficulty: (index) => {
+                if (this.gameMode !== 'ai') return;
+                this.setAIDifficulty(index);
+            }
+        });
+        this.ui.setPauseSliders(this.musicVolume, this.sfxVolume);
         this.input = new InputManager(this);
 
         window.addEventListener('resize', () => this.onResize());
         this.animate();
+    }
+
+    initBackgroundAudio() {
+        const src = CONFIG.ASSETS.MAP_BG_SOUND;
+        if (!src) return;
+
+        this.bgAudio = new Audio(src);
+        this.bgAudio.preload = 'auto';
+        this.bgAudio.loop = true;
+        this.bgAudio.volume = this.musicVolume;
+
+        const unlock = () => {
+            this.bgAudioUnlocked = true;
+            this.tryPlayBackgroundAudio();
+            window.removeEventListener('keydown', unlock);
+            window.removeEventListener('pointerdown', unlock);
+            window.removeEventListener('touchstart', unlock);
+        };
+
+        window.addEventListener('keydown', unlock, { once: true });
+        window.addEventListener('pointerdown', unlock, { once: true });
+        window.addEventListener('touchstart', unlock, { once: true });
+    }
+
+    tryPlayBackgroundAudio() {
+        if (!this.bgAudio || !this.bgAudioUnlocked) return;
+        if (this.bgAudio.paused) {
+            this.bgAudio.play().catch(() => {});
+        }
     }
 
     initLights() {
@@ -88,6 +209,7 @@ class Game {
             const bg = new THREE.Mesh(bgGeo, bgMat);
             bg.position.z = -5;
             bg.position.y = 5;
+            this.legacyBackground = bg;
             this.scene.add(bg);
         });
 
@@ -96,13 +218,104 @@ class Game {
         const floor = new THREE.Mesh(floorGeo, floorMat);
         floor.rotation.x = -Math.PI / 2;
         floor.receiveShadow = true;
+        this.legacyFloor = floor;
         this.scene.add(floor);
+
+        this.tryLoadArenaMap();
+    }
+
+    getArenaCandidates() {
+        const base = CONFIG.ASSETS.ARENA_MAP;
+        if (!base) return [];
+        return [
+            base,
+            `${base}.glb`,
+            `${base}.gltf`,
+            `${base}.fbx`
+        ];
+    }
+
+    finalizeArenaMap(root) {
+        if (!root) return;
+        const box = new THREE.Box3().setFromObject(root);
+        if (!Number.isFinite(box.min.x) || !Number.isFinite(box.max.x)) return;
+
+        const center = box.getCenter(new THREE.Vector3());
+        root.position.x -= center.x;
+        root.position.z -= center.z;
+        root.position.y -= box.min.y;
+
+        const size = box.getSize(new THREE.Vector3());
+        if (size.x > 0) {
+            const targetWidth = 24;
+            const s = THREE.MathUtils.clamp(targetWidth / size.x, 0.03, 5);
+            root.scale.setScalar(s);
+            const post = new THREE.Box3().setFromObject(root);
+            root.position.y -= post.min.y;
+        }
+
+        root.traverse((child) => {
+            if (!child.isMesh) return;
+            child.castShadow = true;
+            child.receiveShadow = true;
+        });
+
+        this.scene.add(root);
+        this.arenaMap = root;
+
+        if (this.legacyBackground) this.legacyBackground.visible = false;
+        if (this.legacyFloor) this.legacyFloor.visible = false;
+    }
+
+    tryLoadArenaMap() {
+        const candidates = this.getArenaCandidates();
+        if (candidates.length === 0) return;
+
+        const gltfLoader = new GLTFLoader();
+        const fbxLoader = new FBXLoader();
+
+        const tryIndex = (i) => {
+            if (i >= candidates.length) return;
+            const src = candidates[i];
+            const lower = src.toLowerCase();
+
+            if (lower.endsWith('.fbx')) {
+                fbxLoader.load(
+                    src,
+                    (fbx) => this.finalizeArenaMap(fbx),
+                    undefined,
+                    () => tryIndex(i + 1)
+                );
+                return;
+            }
+
+            gltfLoader.load(
+                src,
+                (gltf) => this.finalizeArenaMap(gltf.scene || gltf.scenes?.[0]),
+                undefined,
+                () => {
+                    if (!lower.endsWith('.glb') && !lower.endsWith('.gltf')) {
+                        fbxLoader.load(
+                            src,
+                            (fbx) => this.finalizeArenaMap(fbx),
+                            undefined,
+                            () => tryIndex(i + 1)
+                        );
+                    } else {
+                        tryIndex(i + 1);
+                    }
+                }
+            );
+        };
+
+        tryIndex(0);
     }
 
     startMatch() {
         this.isSelecting = false;
         this.ui.hideSelection();
         this.ui.hideGameOver();
+        this.tryPlayBackgroundAudio();
         
         const chars = CONFIG.ASSETS.CHARACTERS;
         if (this.p1) this.scene.remove(this.p1);
@@ -119,6 +332,9 @@ class Game {
         this.scene.add(this.p2);
 
         this.input.setFighters(this.p1, this.p2);
+        this.p1.setSfxVolume(this.sfxVolume);
+        this.p2.setSfxVolume(this.sfxVolume);
+        this.ui.setAIDifficultyUI(this.aiDifficultyLevels, this.aiDifficultyIndex, this.gameMode === 'ai', this.selectionFocus);
         this.ui.setPlayerNames(chars[this.p1Index].name, chars[this.p2Index].name);
         this.applyRotationDebugState();
 
@@ -144,8 +360,43 @@ class Game {
         this.p2.isGrounded = true;
         this.p1.position.set(-3, 0, 0);
         this.p2.position.set(3, 0, 0);
+        this.previousFighterDeltaX = this.p2.position.x - this.p1.position.x;
+        this.jumpOverDelayCooldown = 0;
+        this.sideSwapGraceTimer = 0;
         if (this.p1.mixer) this.p1.playAnimation('IDLE');
         if (this.p2.mixer) this.p2.playAnimation('IDLE');
+    }
+
+    updateJumpOverDelay(dt) {
+        if (!this.p1 || !this.p2) return;
+        this.jumpOverDelayCooldown = Math.max(0, this.jumpOverDelayCooldown - dt);
+        this.sideSwapGraceTimer = Math.max(0, this.sideSwapGraceTimer - dt);
+
+        const deltaX = this.p2.position.x - this.p1.position.x;
+        if (this.previousFighterDeltaX === null) {
+            this.previousFighterDeltaX = deltaX;
+            return;
+        }
+
+        const prevSign = Math.sign(this.previousFighterDeltaX);
+        const newSign = Math.sign(deltaX);
+
+        if (prevSign !== 0 && newSign !== 0 && prevSign !== newSign && this.jumpOverDelayCooldown <= 0) {
+            this.sideSwapGraceTimer = Math.max(this.sideSwapGraceTimer, 0.14);
+            const p1Airborne = !this.p1.isGrounded;
+            const p2Airborne = !this.p2.isGrounded;
+            if (p1Airborne !== p2Airborne) {
+                const jumper = p1Airborne ? this.p1 : this.p2;
+                const jumpedOver = p1Airborne ? this.p2 : this.p1;
+                const verticalGap = jumper.position.y - jumpedOver.position.y;
+                if (verticalGap > 0.35 && typeof jumpedOver.applyJumpOverDelay === 'function') {
+                    jumpedOver.applyJumpOverDelay(0.16);
+                    this.jumpOverDelayCooldown = 0.26;
+                }
+            }
+        }
+
+        this.previousFighterDeltaX = deltaX;
     }
 
     delay(ms) {
@@ -153,6 +404,10 @@ class Game {
     }
 
     async startRoundIntro() {
+        while ((this.p1 && !this.p1.isReady) || (this.p2 && !this.p2.isReady)) {
+            await this.delay(40);
+        }
+
         this.roundInProgress = false;
         this.timer = 99;
         this.ui.update(this.p1.health, this.p2.health, this.timer);
@@ -167,6 +422,42 @@ class Game {
     toggleRotationDebug() {
         this.rotationDebugEnabled = !this.rotationDebugEnabled;
         this.applyRotationDebugState();
+    }
+
+    togglePause(forceState = null) {
+        if (this.isSelecting || this.isGameOver || this.roundTransitionActive) return;
+        this.isPaused = forceState === null ? !this.isPaused : !!forceState;
+        if (this.isPaused) {
+            this.ui.setAIDifficultyUI(this.aiDifficultyLevels, this.aiDifficultyIndex, this.gameMode === 'ai', this.selectionFocus);
+            this.ui.showPauseMenu();
+        }
+        else this.ui.hidePauseMenu();
+    }
+
+    setMusicVolume(volume) {
+        this.musicVolume = THREE.MathUtils.clamp(volume, 0, 1);
+        if (this.bgAudio) this.bgAudio.volume = this.musicVolume;
+    }
+
+    setSfxVolume(volume) {
+        this.sfxVolume = THREE.MathUtils.clamp(volume, 0, 1);
+        if (this.p1) this.p1.setSfxVolume(this.sfxVolume);
+        if (this.p2) this.p2.setSfxVolume(this.sfxVolume);
+    }
+
+    setAIDifficulty(index) {
+        const max = this.aiDifficultyLevels.length - 1;
+        this.aiDifficultyIndex = THREE.MathUtils.clamp(index, 0, max);
+        this.ui.setAIDifficultyUI(this.aiDifficultyLevels, this.aiDifficultyIndex, this.gameMode === 'ai', this.selectionFocus);
+        if (this.input && typeof this.input.onAIDifficultyChanged === 'function') {
+            this.input.onAIDifficultyChanged();
+        }
+    }
+
+    adjustAIDifficulty(delta) {
+        const len = this.aiDifficultyLevels.length;
+        const next = (this.aiDifficultyIndex + delta + len) % len;
+        this.setAIDifficulty(next);
     }
 
     applyRotationDebugState() {
@@ -196,17 +487,33 @@ class Game {
             const src = this.hitAudio[key];
             if (!src) continue;
             const sfx = src.cloneNode();
-            sfx.volume = src.volume;
+            sfx.volume = src.volume * this.sfxVolume;
             sfx.play().catch(() => {});
         }
     }
 
-    onHitImpact(point, attackMeta = null) {
+    onHitImpact(point, attackMeta = null, attacker = null, victim = null) {
         this.spawnImpactParticles(point);
         this.spawnShockwave(point);
         this.shakeTimer = 0.3;
         this.playHitAudio(attackMeta);
         this.ui.flashDamageVignette(100);
+
+        const heavy = attackMeta && attackMeta.heavy;
+        const comboFinisher = victim && victim.comboHits >= 6;
+        if (heavy && comboFinisher && attacker && victim) {
+            this.cinematicAttack = {
+                timer: 0.45,
+                attacker,
+                victim
+            };
+        }
+    }
+
+    onBlockImpact(point, attackMeta = null, defender = null) {
+        this.spawnBlockParticles(point);
+        this.shakeTimer = Math.max(this.shakeTimer, 0.12);
+        this.ui.flashDamageVignette(60);
     }
 
     onFighterKnockedOut(fighter) {
@@ -247,6 +554,142 @@ class Game {
         this.shockwaves.push({ mesh: ring, life: 0.35, maxLife: 0.35 });
     }
 
+    spawnBlockParticles(point) {
+        const mkParticle = (color, speed, life) => {
+            const mesh = new THREE.Mesh(
+                new THREE.SphereGeometry(0.024, 6, 6),
+                new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 1 })
+            );
+            mesh.position.copy(point);
+            const vel = new THREE.Vector3(
+                (Math.random() - 0.5) * speed,
+                (Math.random() * 0.7 + 0.2) * speed,
+                (Math.random() - 0.5) * speed
+            );
+            this.scene.add(mesh);
+            this.impactParticles.push({ mesh, vel, life, maxLife: life });
+        };
+
+        for (let i = 0; i < 8; i++) mkParticle(0xd6d0c8, 1.9, 0.28); // dust
+        for (let i = 0; i < 6; i++) mkParticle(0x99d7ff, 2.3, 0.2);  // guard sparks
+
+        const ring = new THREE.Mesh(
+            new THREE.RingGeometry(0.05, 0.09, 28),
+            new THREE.MeshBasicMaterial({ color: 0xaee8ff, transparent: true, opacity: 0.75, side: THREE.DoubleSide })
+        );
+        ring.position.copy(point);
+        ring.rotation.x = -Math.PI / 2;
+        this.scene.add(ring);
+        this.shockwaves.push({ mesh: ring, life: 0.2, maxLife: 0.2 });
+    }
+
+    performStompWave(caster, opponent) {
+        const center = new THREE.Vector3(caster.position.x, 0.08, 0);
+        const wave = new THREE.Mesh(
+            new THREE.RingGeometry(0.2, 0.34, 40),
+            new THREE.MeshBasicMaterial({ color: 0x74d6ff, transparent: true, opacity: 0.85, side: THREE.DoubleSide })
+        );
+        wave.position.copy(center);
+        wave.rotation.x = -Math.PI / 2;
+        this.scene.add(wave);
+        this.shockwaves.push({ mesh: wave, life: 0.45, maxLife: 0.45 });
+
+        this.spawnImpactParticles(new THREE.Vector3(caster.position.x, 0.25, 0));
+        this.shakeTimer = Math.max(this.shakeTimer, 0.25);
+
+        if (!opponent || opponent.state === FighterState.DEAD) return;
+        const inRange = Math.abs(opponent.position.x - caster.position.x) <= 3.3;
+        if (!inRange) return;
+
+        const meta = { move: 'STOMP_WAVE', heavy: true };
+        opponent.takeDamage(12, meta);
+        this.onHitImpact(new THREE.Vector3((caster.position.x + opponent.position.x) * 0.5, 0.65, 0), meta, caster, opponent);
+    }
+
+    spawnFireball(caster, target) {
+        if (!caster) return;
+        const mesh = new THREE.Mesh(
+            new THREE.SphereGeometry(0.16, 16, 16),
+            new THREE.MeshStandardMaterial({
+                color: 0xff5a00,
+                emissive: 0xff3a00,
+                emissiveIntensity: 1.8,
+                roughness: 0.25,
+                metalness: 0.05
+            })
+        );
+        mesh.position.set(caster.position.x + caster.facingDirection * 0.65, 1.1, 0);
+        this.scene.add(mesh);
+
+        const light = new THREE.PointLight(0xff7a2a, 1.2, 3.2, 2.0);
+        light.position.copy(mesh.position);
+        this.scene.add(light);
+
+        this.fireballs.push({
+            mesh,
+            light,
+            owner: caster,
+            target,
+            dir: caster.facingDirection,
+            speed: 9.6,
+            life: 1.25,
+            trail: 0
+        });
+    }
+
+    clearFireballs() {
+        for (const f of this.fireballs) {
+            this.scene.remove(f.mesh);
+            this.scene.remove(f.light);
+        }
+        this.fireballs = [];
+    }
+
+    updateFireballs(dt) {
+        this.fireballs = this.fireballs.filter((f) => {
+            f.life -= dt;
+            f.trail -= dt;
+            f.mesh.position.x += f.dir * f.speed * dt;
+            f.mesh.position.y = 1.1 + Math.sin((1.25 - f.life) * 14) * 0.03;
+            f.light.position.copy(f.mesh.position);
+
+            if (f.trail <= 0) {
+                f.trail = 0.04;
+                const spark = new THREE.Mesh(
+                    new THREE.SphereGeometry(0.03, 6, 6),
+                    new THREE.MeshBasicMaterial({ color: 0xffa347, transparent: true, opacity: 0.9 })
+                );
+                spark.position.copy(f.mesh.position);
+                const vel = new THREE.Vector3(-f.dir * 1.2, 0.2 + Math.random() * 0.8, (Math.random() - 0.5) * 0.6);
+                this.scene.add(spark);
+                this.impactParticles.push({ mesh: spark, vel, life: 0.16, maxLife: 0.16 });
+            }
+
+            const outOfBounds = Math.abs(f.mesh.position.x) > CONFIG.FIGHTER.BOUNDS + 3;
+            if (outOfBounds || f.life <= 0) {
+                this.scene.remove(f.mesh);
+                this.scene.remove(f.light);
+                return false;
+            }
+
+            const target = f.target;
+            if (target && target.state !== FighterState.DEAD) {
+                const hitX = Math.abs(f.mesh.position.x - target.position.x) < 0.75;
+                const hitY = Math.abs(f.mesh.position.y - (target.position.y + 0.95)) < 1.15;
+                if (hitX && hitY) {
+                    const meta = { move: 'FIREBALL', heavy: true };
+                    target.takeDamage(13, meta);
+                    this.onHitImpact(f.mesh.position.clone(), meta, f.owner, target);
+                    this.scene.remove(f.mesh);
+                    this.scene.remove(f.light);
+                    return false;
+                }
+            }
+
+            return true;
+        });
+    }
+
     updateImpactEffects(dt) {
         this.impactParticles = this.impactParticles.filter((p) => {
             p.life -= dt;
@@ -278,45 +721,74 @@ class Game {
         const rawDt = this.clock.getDelta();
         const dt = rawDt;
         this.updateImpactEffects(rawDt);
+        this.updateFireballs(rawDt);
 
         if (this.isSelecting) {
-            this.ui.updateSelection(this.p1Index, this.p1Ready, this.p2Index, this.p2Ready);
+            this.ui.updateSelection(
+                this.p1Index,
+                this.p1Ready,
+                this.p2Index,
+                this.p2Ready,
+                this.gameMode,
+                this.selectionFocus,
+                { levels: this.aiDifficultyLevels, index: this.aiDifficultyIndex },
+                this.aiSelectStage
+            );
             if (this.p1Ready && this.p2Ready) {
                 this.startMatch();
             }
             return;
         }
 
-        if (this.isGameOver || !this.roundInProgress) return;
+        if (this.isPaused) return;
+        if (this.isGameOver || (!this.roundInProgress && !this.roundTransitionActive)) return;
         
-        this.input.update();
+        if (this.roundInProgress) this.input.update(dt);
         if (this.p1 && this.p2) {
             this.p1.update(dt, this.p2);
             this.p2.update(dt, this.p1);
 
-            this.timer -= dt;
-            if (this.timer <= 0) {
-                this.timer = 0;
-                this.finishRound();
-                return;
-            }
+            if (this.roundInProgress) {
+                // Keep grounded fighters from passing through each other.
+                // Side swaps are allowed only when one fighter jumps over.
+                const minGap = this.sideSwapGraceTimer > 0 ? 0.18 : 0.85;
+                if (this.p1.isGrounded && this.p2.isGrounded) {
+                    const distX = Math.abs(this.p1.position.x - this.p2.position.x);
+                    if (distX < minGap) {
+                        const mid = (this.p1.position.x + this.p2.position.x) * 0.5;
+                        if (this.p1.position.x <= this.p2.position.x) {
+                            this.p1.position.x = mid - minGap * 0.5;
+                            this.p2.position.x = mid + minGap * 0.5;
+                        } else {
+                            this.p1.position.x = mid + minGap * 0.5;
+                            this.p2.position.x = mid - minGap * 0.5;
+                        }
+                    }
+                }
 
-            if (this.p1.health <= 0) {
-                if (!this.p1.isKOSequenceActive) this.finishRound('PLAYER 2');
-                return;
-            }
-            if (this.p2.health <= 0) {
-                if (!this.p2.isKOSequenceActive) this.finishRound('PLAYER 1');
-                return;
-            }
+                this.updateJumpOverDelay(dt);
 
-            this.ui.update(this.p1.health, this.p2.health, this.timer);
-            const p1Combo = this.p1.getComboMeter();
-            const p2Combo = this.p2.getComboMeter();
-            const active = p1Combo.hits >= p2Combo.hits
-                ? { label: 'P1 UNDER PRESSURE', ...p1Combo }
-                : { label: 'P2 UNDER PRESSURE', ...p2Combo };
-            this.ui.updateComboMeter(active.label, active.ratio, active.hits, active.nearKnockdown);
+                this.timer -= dt;
+                if (this.timer <= 0) {
+                    this.timer = 0;
+                    this.finishRound();
+                    return;
+                }
+
+                if (this.p1.health <= 0) {
+                    if (!this.p1.isKOSequenceActive) this.finishRound('PLAYER 2');
+                    return;
+                }
+                if (this.p2.health <= 0) {
+                    if (!this.p2.isKOSequenceActive) this.finishRound('PLAYER 1');
+                    return;
+                }
+
+                this.ui.update(this.p1.health, this.p2.health, this.timer);
+                const p1Combo = this.p1.getComboMeter();
+                const p2Combo = this.p2.getComboMeter();
+                this.ui.updatePressureMeters(p1Combo, p2Combo);
+            }
 
             if (this.rotationDebugEnabled) {
                 const jumpInfo = this.p1.getJumpClipInfo();
@@ -329,42 +801,127 @@ class Game {
 
             const midX = (this.p1.position.x + this.p2.position.x) / 2;
             const dist = Math.abs(this.p1.position.x - this.p2.position.x);
-            this.camera.position.x += (midX - this.camera.position.x) * 0.1;
-            this.camera.position.z = 6.3 + dist * 0.22;
-            if (this.shakeTimer > 0) {
-                this.shakeTimer -= rawDt;
-                this.camera.position.x += (Math.random() - 0.5) * this.shakeIntensity;
-                this.camera.position.y += (Math.random() - 0.5) * this.shakeIntensity * 0.5;
+            if (this.cinematicAttack && this.cinematicAttack.timer > 0) {
+                this.cinematicAttack.timer -= rawDt;
+                const atk = this.cinematicAttack.attacker;
+                const vic = this.cinematicAttack.victim;
+                const focusX = (atk.position.x + vic.position.x) * 0.5;
+                const targetX = focusX + atk.facingDirection * 1.1;
+                this.camera.position.x += (targetX - this.camera.position.x) * 0.2;
+                this.camera.position.y += (2.2 - this.camera.position.y) * 0.2;
+                this.camera.position.z += (4.3 - this.camera.position.z) * 0.2;
+                this.camera.lookAt(focusX, 1.25, 0);
+                if (this.cinematicAttack.timer <= 0) this.cinematicAttack = null;
+            } else {
+                this.camera.position.x += (midX - this.camera.position.x) * 0.1;
+                this.camera.position.z = 6.3 + dist * 0.22;
+                if (this.shakeTimer > 0) {
+                    this.shakeTimer -= rawDt;
+                    this.camera.position.x += (Math.random() - 0.5) * this.shakeIntensity;
+                    this.camera.position.y += (Math.random() - 0.5) * this.shakeIntensity * 0.5;
+                }
+                this.camera.lookAt(midX, 1.5, 0);
             }
-            this.camera.lookAt(midX, 1.5, 0);
         }
     }
 
-    finishRound(winner) {
-        if (!this.roundInProgress) return;
+    async playRoundReturnToStart() {
+        if (!this.p1 || !this.p2) return;
+        const durationMs = 850;
+        const startP1 = this.p1.position.x;
+        const startP2 = this.p2.position.x;
+        const targetP1 = -3;
+        const targetP2 = 3;
+
+        const p1Move = this.p1.config.id === 'young_zealous' && this.p1.animations.BACK_WALK ? 'BACK_WALK' : 'IDLE';
+        const p2Move = this.p2.config.id === 'young_zealous' && this.p2.animations.BACK_WALK ? 'BACK_WALK' : 'IDLE';
+        if (this.p1.mixer && this.p1.animations[p1Move]) this.p1.playAnimation(p1Move, 0.08, true, 0.78);
+        if (this.p2.mixer && this.p2.animations[p2Move]) this.p2.playAnimation(p2Move, 0.08, true, 0.78);
+
+        const begin = performance.now();
+        await new Promise((resolve) => {
+            const step = (now) => {
+                const t = Math.min(1, (now - begin) / durationMs);
+                this.p1.position.x = THREE.MathUtils.lerp(startP1, targetP1, t);
+                this.p2.position.x = THREE.MathUtils.lerp(startP2, targetP2, t);
+                this.p1.position.y = 0;
+                this.p2.position.y = 0;
+                if (t < 1) requestAnimationFrame(step);
+                else resolve();
+            };
+            requestAnimationFrame(step);
+        });
+
+        if (this.p1.mixer) this.p1.playAnimation('IDLE', 0.1, true);
+        if (this.p2.mixer) this.p2.playAnimation('IDLE', 0.1, true);
+    }
+
+    async finishRound(winner) {
+        if (!this.roundInProgress || this.roundTransitionActive) return;
         this.roundInProgress = false;
+        this.roundTransitionActive = true;
 
         if (!winner) winner = this.p1.health >= this.p2.health ? 'PLAYER 1' : 'PLAYER 2';
         if (winner === 'PLAYER 1') this.roundWins.p1 += 1;
         else this.roundWins.p2 += 1;
 
+        // Let KO / victory reaction animations play before repositioning fighters.
+        await this.delay(this.roundEndPlaybackMs);
+
+        await this.playRoundReturnToStart();
+
         if (this.currentRound >= this.totalRounds) {
-            this.finishMatch();
+            await this.finishMatch();
+            this.roundTransitionActive = false;
             return;
         }
 
         this.currentRound += 1;
         this.ui.setRound(this.currentRound, this.totalRounds);
         this.resetFightersForRound();
-        this.startRoundIntro();
+        await this.startRoundIntro();
+        this.roundTransitionActive = false;
     }
 
-    finishMatch() {
+    async playWinnerBackflipReturn(winnerLabel) {
+        const winnerFighter = winnerLabel === 'PLAYER 1' ? this.p1 : (winnerLabel === 'PLAYER 2' ? this.p2 : null);
+        if (!winnerFighter || winnerFighter.config.id !== 'young_zealous' || !winnerFighter.animations.WIN_BACKFLIP) return;
+
+        const targetX = winnerFighter === this.p1 ? -3 : 3;
+        const startX = winnerFighter.position.x;
+        const clipDuration = winnerFighter.animations.WIN_BACKFLIP.duration || 0.8;
+        const totalMs = clipDuration * 1000;
+        const peakY = 1.15;
+
+        winnerFighter.playAnimation('WIN_BACKFLIP', 0.06, false, 1);
+
+        const start = performance.now();
+        await new Promise((resolve) => {
+            const step = (now) => {
+                const t = Math.min(1, (now - start) / totalMs);
+                winnerFighter.position.x = THREE.MathUtils.lerp(startX, targetX, t);
+                winnerFighter.position.y = 4 * peakY * t * (1 - t);
+                if (t < 1) requestAnimationFrame(step);
+                else {
+                    winnerFighter.position.x = targetX;
+                    winnerFighter.position.y = 0;
+                    resolve();
+                }
+            };
+            requestAnimationFrame(step);
+        });
+
+        if (winnerFighter.mixer) winnerFighter.playAnimation('IDLE', 0.08, true);
+    }
+
+    async finishMatch() {
         if (this.isGameOver) return;
         this.isGameOver = true;
         let winner = 'DRAW';
         if (this.roundWins.p1 > this.roundWins.p2) winner = 'PLAYER 1';
         if (this.roundWins.p2 > this.roundWins.p1) winner = 'PLAYER 2';
+
+        await this.playWinnerBackflipReturn(winner);
         this.ui.showGameOver(winner, `ROUND SCORE ${this.roundWins.p1} - ${this.roundWins.p2}`);
     }
 
@@ -372,6 +929,7 @@ class Game {
         this.isGameOver = false;
         this.currentRound = 1;
         this.roundWins = { p1: 0, p2: 0 };
+        this.clearFireballs();
         this.ui.setRound(this.currentRound, this.totalRounds);
         this.ui.hideGameOver();
         this.resetFightersForRound();
@@ -381,15 +939,26 @@ class Game {
     quitToSelection() {
         this.isGameOver = false;
         this.roundInProgress = false;
+        this.roundTransitionActive = false;
+        this.isPaused = false;
         this.isSelecting = true;
+        this.gameMode = 'multiplayer';
+        this.selectionFocus = 'mode';
+        this.aiSelectStage = 'p1';
         this.p1Ready = false;
         this.p2Ready = false;
         if (this.p1) this.scene.remove(this.p1);
         if (this.p2) this.scene.remove(this.p2);
+        this.clearFireballs();
         this.p1 = null;
         this.p2 = null;
+        this.previousFighterDeltaX = null;
+        this.jumpOverDelayCooldown = 0;
+        this.sideSwapGraceTimer = 0;
+        this.ui.setAIDifficultyUI(this.aiDifficultyLevels, this.aiDifficultyIndex, false, this.selectionFocus);
         this.input.setFighters(null, null);
         this.ui.showSelection();
+        this.ui.hidePauseMenu();
     }
 
     animate() {

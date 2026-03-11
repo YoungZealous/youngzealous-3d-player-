@@ -25,6 +25,8 @@ export class Fighter extends THREE.Group {
         this.isGrounded = true;
         this.facingDirection = playerNum === 1 ? 1 : -1;
         this.playerRotationOffset = 0;
+        this.isReady = false;
+        this.lastMoveDir = 0;
         
         this.animations = {};
         this.mixer = null;
@@ -36,32 +38,150 @@ export class Fighter extends THREE.Group {
         this.lastPunchTime = 0;
         this.rotationGizmo = null;
         this.yzHurtSounds = [];
+        this.yzBlockSounds = [];
+        this.yzJumpSounds = [];
         this.yzHurtSoundIndex = 0;
+        this.yzBlockSoundIndex = 0;
+        this.lastYzJumpSoundIndex = -1;
+        this.yzStepSound = null;
+        this.sfxVolume = 1;
         this.comboHits = 0;
         this.comboWindow = 0;
         this.lastAttackMeta = { heavy: false, move: '' };
         this.isKOSequenceActive = false;
         this.koEndsRound = false;
+        this.controlLockTimer = 0;
         
         this.initMesh();
         this.initCollision();
         this.initYoungZealousAudio();
-        this.loadAnimations();
+        this.readyPromise = this.loadAnimations();
     }
 
     initYoungZealousAudio() {
-        if (this.config.id !== 'young_zealous') return;
         const sources = CONFIG.ASSETS.YOUNG_ZEALOUS_HURT_SOUNDS || [];
         this.yzHurtSounds = sources.map((src) => {
             const audio = new Audio(src);
             audio.preload = 'auto';
-            audio.volume = 0.85;
+            audio.volume = 0.85 * this.sfxVolume;
             return audio;
         });
+
+        const blockSources = CONFIG.ASSETS.YOUNG_ZEALOUS_BLOCK_SOUNDS || [];
+        this.yzBlockSounds = blockSources.map((src) => {
+            const audio = new Audio(src);
+            audio.preload = 'auto';
+            audio.volume = 0.72 * this.sfxVolume;
+            return audio;
+        });
+
+        const jumpSources = CONFIG.ASSETS.YOUNG_ZEALOUS_JUMP_SOUNDS || [];
+        this.yzJumpSounds = jumpSources.map((src) => {
+            const audio = new Audio(src);
+            audio.preload = 'auto';
+            audio.volume = 0.9 * this.sfxVolume;
+            return audio;
+        });
+
+        const stepSrc = CONFIG.ASSETS.YOUNG_ZEALOUS_STEP_SOUND;
+        if (stepSrc) {
+            this.yzStepSound = new Audio(stepSrc);
+            this.yzStepSound.preload = 'auto';
+            this.yzStepSound.loop = true;
+            this.yzStepSound.volume = 0.28 * this.sfxVolume;
+            this.yzStepSound.playbackRate = 1;
+        }
+    }
+
+    setSfxVolume(volume) {
+        this.sfxVolume = THREE.MathUtils.clamp(volume, 0, 1);
+        for (const audio of this.yzHurtSounds) {
+            audio.volume = 0.85 * this.sfxVolume;
+        }
+        for (const audio of this.yzBlockSounds) {
+            audio.volume = 0.72 * this.sfxVolume;
+        }
+        for (const audio of this.yzJumpSounds) {
+            audio.volume = 0.9 * this.sfxVolume;
+        }
+        if (this.yzStepSound) {
+            this.yzStepSound.volume = 0.28 * this.sfxVolume;
+        }
+    }
+
+    setYzStepPlaybackRate(rate = 1) {
+        if (!this.yzStepSound || this.config.id !== 'young_zealous') return;
+        this.yzStepSound.playbackRate = THREE.MathUtils.clamp(rate, 0.55, 1.3);
+    }
+
+    playRandomYoungZealousJumpSound() {
+        if (this.config.id !== 'young_zealous' || this.yzJumpSounds.length === 0) return;
+
+        let idx = Math.floor(Math.random() * this.yzJumpSounds.length);
+        if (this.yzJumpSounds.length > 1 && idx === this.lastYzJumpSoundIndex) {
+            idx = (idx + 1 + Math.floor(Math.random() * (this.yzJumpSounds.length - 1))) % this.yzJumpSounds.length;
+        }
+
+        this.lastYzJumpSoundIndex = idx;
+        const audio = this.yzJumpSounds[idx];
+        if (!audio) return;
+
+        audio.pause();
+        audio.currentTime = 0;
+        const playAttempt = audio.play();
+        if (playAttempt && typeof playAttempt.catch === 'function') {
+            playAttempt.catch(() => {});
+        }
+    }
+
+    setYzStepSoundPlaying(shouldPlay) {
+        if (!this.yzStepSound || this.config.id !== 'young_zealous') return;
+        if (shouldPlay) {
+            if (this.yzStepSound.paused) {
+                this.yzStepSound.play().catch(() => {});
+            }
+            return;
+        }
+
+        if (!this.yzStepSound.paused) {
+            this.yzStepSound.pause();
+            this.yzStepSound.currentTime = 0;
+        }
+    }
+
+    applyJumpOverDelay(duration = 0.15) {
+        this.controlLockTimer = Math.max(this.controlLockTimer, duration);
+        this.setYzStepSoundPlaying(false);
+    }
+
+    freezeYoungZealousBlockAtLastFrame() {
+        if (this.config.id !== 'young_zealous' || !this.mixer || !this.animations.BLOCK) return;
+        const clip = this.animations.BLOCK;
+        const action = this.mixer.clipAction(clip);
+
+        if (this.currentAction && this.currentAction !== action) {
+            this.currentAction.fadeOut(0.04);
+        }
+
+        action.enabled = true;
+        action.reset();
+        action.setLoop(THREE.LoopOnce, 1);
+        action.clampWhenFinished = true;
+        action.play();
+        action.time = Math.max(0, clip.duration - 1 / 30);
+        action.paused = true;
+
+        this.currentAction = action;
+        this.currentActionTrimEnd = null;
+    }
+
+    playYoungZealousBlockHitReact() {
+        if (this.config.id !== 'young_zealous' || !this.mixer || !this.animations.BLOCK) return;
+        this.playAnimation('BLOCK', 0.04, false, 1, 0, 1);
     }
 
     playNextYoungZealousHurtSound() {
-        if (this.config.id !== 'young_zealous' || this.yzHurtSounds.length === 0) return;
+        if (this.yzHurtSounds.length === 0) return;
         const maxTries = this.yzHurtSounds.length;
         let tries = 0;
 
@@ -83,8 +203,34 @@ export class Fighter extends THREE.Group {
         }
     }
 
+    playNextYoungZealousBlockSound() {
+        if (this.yzBlockSounds.length === 0) return;
+        const maxTries = this.yzBlockSounds.length;
+        let tries = 0;
+
+        while (tries < maxTries) {
+            const audio = this.yzBlockSounds[this.yzBlockSoundIndex];
+            this.yzBlockSoundIndex = (this.yzBlockSoundIndex + 1) % this.yzBlockSounds.length;
+            tries += 1;
+            if (!audio) continue;
+
+            audio.pause();
+            audio.currentTime = 0;
+            const playAttempt = audio.play();
+            if (playAttempt && typeof playAttempt.catch === 'function') {
+                playAttempt.catch(() => {
+                    // Missing or blocked source; next block will continue sequence.
+                });
+            }
+            break;
+        }
+    }
+
     initMesh() {
         this.modelGroup = new THREE.Group();
+        if (this.config.id === 'young_zealous') {
+            this.modelGroup.visible = false;
+        }
         this.add(this.modelGroup);
 
         if (this.config.id === 'young_zealous') {
@@ -225,6 +371,20 @@ export class Fighter extends THREE.Group {
         return this.jumpClipInfo;
     }
 
+    scheduleHitboxWindow(startMs, activeMs = 120) {
+        this.hitboxActive = false;
+
+        setTimeout(() => {
+            if (this.state === FighterState.PUNCHING || this.state === FighterState.KICKING) {
+                this.hitboxActive = true;
+            }
+        }, Math.max(0, startMs));
+
+        setTimeout(() => {
+            this.hitboxActive = false;
+        }, Math.max(0, startMs + activeMs));
+    }
+
     async loadAnimations() {
         const loader = new FBXLoader();
         const animPromises = [];
@@ -284,12 +444,19 @@ export class Fighter extends THREE.Group {
                         }
                     }
                     resolve();
+                }, undefined, () => {
+                    // Fail-safe: do not block fighter spawn if a single clip URL is invalid.
+                    resolve();
                 });
             }));
         }
 
         await Promise.all(animPromises);
-        if (this.config.id === 'young_zealous') this.playAnimation('IDLE');
+        if (this.config.id === 'young_zealous') {
+            this.playAnimation('IDLE', 0.12, true, 1);
+            this.modelGroup.visible = true;
+        }
+        this.isReady = true;
     }
 
     triggerYoungZealousMove(name, duration = 600) {
@@ -309,8 +476,8 @@ export class Fighter extends THREE.Group {
         this.playAnimation(name, 0.08, false, 1);
 
         if (isAttack) {
-            this.hitboxActive = false;
-            setTimeout(() => this.hitboxActive = true, 120);
+            const hitStart = name === 'FLYING' ? 200 : 170;
+            this.scheduleHitboxWindow(hitStart, 130);
         }
 
         setTimeout(() => {
@@ -320,6 +487,173 @@ export class Fighter extends THREE.Group {
                 this.playAnimation('IDLE');
             }
         }, duration);
+    }
+
+    canUseYzSpecial() {
+        return this.config.id === 'young_zealous'
+            && this.mixer
+            && ![FighterState.DEAD, FighterState.HIT].includes(this.state)
+            && this.controlLockTimer <= 0
+            && !this.isKOSequenceActive;
+    }
+
+    selectFirstAvailableAnimation(candidates, fallback = 'IDLE') {
+        for (const name of candidates) {
+            if (this.animations[name]) return name;
+        }
+        return fallback;
+    }
+
+    triggerGrabSlam(opponent) {
+        if (!this.canUseYzSpecial()) return;
+        const anim = this.selectFirstAvailableAnimation(['GRAB_SLAM', 'BIG_STOMACH_HIT'], 'IDLE');
+        this.state = FighterState.PUNCHING;
+        this.hitboxActive = false;
+        this.lastAttackMeta = { move: 'GRAB_SLAM', heavy: true };
+        this.playAnimation(anim, 0.06, false, 1.0);
+
+        setTimeout(() => {
+            if (!opponent || opponent.state === FighterState.DEAD) return;
+            const closeEnough = Math.abs(opponent.position.x - this.position.x) <= 1.9;
+            if (!closeEnough) return;
+
+            opponent.takeDamage(14, this.lastAttackMeta);
+            const slamX = THREE.MathUtils.clamp(
+                this.position.x - this.facingDirection * 1.35,
+                -CONFIG.FIGHTER.BOUNDS,
+                CONFIG.FIGHTER.BOUNDS
+            );
+            opponent.position.x = slamX;
+            opponent.position.y = 0.2;
+            opponent.velocity.y = 0.06;
+            opponent.isGrounded = false;
+
+            const hitAnim = opponent.config.id === 'young_zealous' && opponent.animations.HIT_REACT ? 'HIT_REACT' : 'HIT';
+            if (opponent.mixer && opponent.animations[hitAnim]) opponent.playAnimation(hitAnim, 0.05, false, 1);
+
+            if (this.game && typeof this.game.onHitImpact === 'function') {
+                const p = new THREE.Vector3((this.position.x + opponent.position.x) * 0.5, 0.95, 0);
+                this.game.onHitImpact(p, this.lastAttackMeta, this, opponent);
+            }
+        }, 220);
+
+        setTimeout(() => {
+            if (this.state === FighterState.PUNCHING) {
+                this.state = FighterState.IDLE;
+                this.playAnimation('IDLE', 0.08, true);
+            }
+        }, 760);
+    }
+
+    triggerDance() {
+        if (!this.canUseYzSpecial()) return;
+        const anim = this.selectFirstAvailableAnimation(['DANCE', 'IDLE'], 'IDLE');
+        this.state = FighterState.WALK;
+        this.hitboxActive = false;
+        this.lastAttackMeta = { move: 'DANCE', heavy: false };
+        this.playAnimation(anim, 0.08, false, 1.0);
+        setTimeout(() => {
+            if (this.state === FighterState.WALK) {
+                this.state = FighterState.IDLE;
+                this.playAnimation('IDLE', 0.08, true);
+            }
+        }, 1200);
+    }
+
+    triggerRollKickFrontFlip(opponent) {
+        if (!this.canUseYzSpecial()) return;
+        this.triggerAdvancedKick('ROLL_KICK_FRONT_FLIP', opponent, 14, 760, 170, 1.0);
+    }
+
+    triggerFunClumbKick(opponent) {
+        if (!this.canUseYzSpecial()) return;
+        this.triggerAdvancedKick('FUN_CLUMB_KICK', opponent, 16, 820, 190, 1.25);
+    }
+
+    triggerAdvancedKick(moveName, opponent, damage, duration, hitboxStart, travelForward = 0) {
+        this.state = FighterState.KICKING;
+        this.hitboxDamage = damage;
+        this.lastAttackMeta = { move: moveName, heavy: true };
+        const anim = this.selectFirstAvailableAnimation([moveName, 'SPINKICK', 'SIDEKICK'], 'IDLE');
+        this.playAnimation(anim, 0.05, false, 1.18);
+
+        if (travelForward > 0) {
+            setTimeout(() => {
+                this.position.x = THREE.MathUtils.clamp(
+                    this.position.x + this.facingDirection * travelForward,
+                    -CONFIG.FIGHTER.BOUNDS,
+                    CONFIG.FIGHTER.BOUNDS
+                );
+            }, Math.round(duration * 0.55));
+        }
+
+        this.scheduleHitboxWindow(hitboxStart, 150);
+        setTimeout(() => {
+            this.hitboxActive = false;
+            if (this.state === FighterState.KICKING) {
+                this.state = FighterState.IDLE;
+                this.playAnimation('IDLE', 0.08, true);
+            }
+        }, duration);
+
+        if (opponent && this.game && typeof this.game.onHitImpact === 'function') {
+            setTimeout(() => {
+                const p = new THREE.Vector3((this.position.x + opponent.position.x) * 0.5, 0.9, 0);
+                this.game.onHitImpact(p, this.lastAttackMeta, this, opponent);
+            }, Math.max(120, hitboxStart - 10));
+        }
+    }
+
+    triggerStompWave(opponent) {
+        if (!this.canUseYzSpecial()) return;
+        const hasStompClip = !!this.animations.STOMP_WAVE;
+        const anim = hasStompClip
+            ? 'STOMP_WAVE'
+            : this.selectFirstAvailableAnimation(['BIG_STOMACH_HIT'], 'IDLE');
+        const animMs = hasStompClip
+            ? Math.max(900, Math.round((this.animations.STOMP_WAVE.duration || 0.9) * 1000))
+            : 900;
+        const waveTriggerMs = Math.round(animMs * 0.72);
+
+        this.state = FighterState.KICKING;
+        this.hitboxActive = false;
+        this.lastAttackMeta = { move: 'STOMP_WAVE', heavy: true };
+        this.playAnimation(anim, 0.06, false, 1.0);
+
+        setTimeout(() => {
+            if (this.game && typeof this.game.performStompWave === 'function') {
+                this.game.performStompWave(this, opponent);
+            }
+        }, waveTriggerMs);
+
+        setTimeout(() => {
+            if (this.state === FighterState.KICKING) {
+                this.state = FighterState.IDLE;
+                this.playAnimation('IDLE', 0.08, true);
+            }
+        }, animMs + 120);
+    }
+
+    castFireball(opponent) {
+        if (!this.canUseYzSpecial()) return;
+        const anim = this.selectFirstAvailableAnimation(['FIREBALL_CAST', 'PUNCH_R'], 'IDLE');
+        this.state = FighterState.PUNCHING;
+        this.hitboxActive = false;
+        this.lastAttackMeta = { move: 'FIREBALL', heavy: true };
+        this.playAnimation(anim, 0.06, false, 1.0);
+
+        setTimeout(() => {
+            if (this.game && typeof this.game.spawnFireball === 'function') {
+                this.game.spawnFireball(this, opponent);
+            }
+        }, 220);
+
+        setTimeout(() => {
+            if (this.state === FighterState.PUNCHING) {
+                this.state = FighterState.IDLE;
+                this.playAnimation('IDLE', 0.08, true);
+            }
+        }, 760);
     }
 
     playAnimation(name, duration = 0.2, loop = true, timeScale = 1, trimStartRatio = 0, trimEndRatio = 1) {
@@ -341,7 +675,7 @@ export class Fighter extends THREE.Group {
         const startTime = THREE.MathUtils.clamp(clipDuration * trimStartRatio, 0, clipDuration);
         const endTime = THREE.MathUtils.clamp(clipDuration * trimEndRatio, 0, clipDuration);
         newAction.time = startTime;
-        this.currentActionTrimEnd = endTime > startTime ? endTime : null;
+        this.currentActionTrimEnd = trimEndRatio < 1 && endTime > startTime ? endTime : null;
 
         newAction.play();
         
@@ -403,7 +737,14 @@ export class Fighter extends THREE.Group {
     }
 
     update(dt, opponent) {
-        if (this.state === FighterState.DEAD) return;
+        if (this.controlLockTimer > 0) {
+            this.controlLockTimer = Math.max(0, this.controlLockTimer - dt);
+        }
+
+        if (this.state === FighterState.DEAD) {
+            this.setYzStepSoundPlaying(false);
+            return;
+        }
 
         if (this.comboWindow > 0) {
             this.comboWindow -= dt;
@@ -412,6 +753,18 @@ export class Fighter extends THREE.Group {
 
         if (this.mixer) {
             this.mixer.update(dt);
+
+            // While holding block, keep final guard frame after hit-react playback completes.
+            if (this.state === FighterState.BLOCKING && this.config.id === 'young_zealous' && this.currentAction) {
+                const clip = this.currentAction.getClip ? this.currentAction.getClip() : null;
+                if (clip && clip.name === 'BLOCK' && !this.currentAction.paused) {
+                    const endTime = Math.max(0, clip.duration - 1 / 30);
+                    if (this.currentAction.time >= endTime) {
+                        this.currentAction.time = endTime;
+                        this.currentAction.paused = true;
+                    }
+                }
+            }
 
             // Optional trim: stop action early to remove unwanted tail frames.
             if (this.currentAction && this.currentActionTrimEnd !== null && this.currentAction.time >= this.currentActionTrimEnd) {
@@ -429,15 +782,16 @@ export class Fighter extends THREE.Group {
         
         this.position.add(this.velocity);
 
-        // Ground check
-        if (this.position.y <= 0) {
+        // Ground check (snap near floor and restore normal playback speed).
+        if (this.position.y <= 0.1) {
             this.position.y = 0;
             this.velocity.y = 0;
             if (!this.isGrounded) {
                 this.isGrounded = true;
+                if (this.mixer) this.mixer.timeScale = 1;
                 if (this.state === FighterState.JUMPING) {
                     this.state = FighterState.IDLE;
-                    if (this.mixer) this.playAnimation('IDLE');
+                    if (this.mixer) this.playAnimation('IDLE', 0.22, true);
                 }
             }
         }
@@ -468,29 +822,39 @@ export class Fighter extends THREE.Group {
 
     updateHitbox() {
         let baseOffset = 0.8;
+        let hitboxSize = new THREE.Vector3(0.8, 0.8, 0.8);
         if (this.state === FighterState.PUNCHING && this.config.id === 'young_zealous') {
             // Pull punch hitbox slightly inward to better match visible arm length.
             baseOffset = 0.58;
+            hitboxSize = new THREE.Vector3(0.78, 0.76, 0.78);
+        } else if (this.state === FighterState.PUNCHING && this.config.id === 'blue_fighter') {
+            // Procedural blue punch needs a bit more forward reach to match visual arm extension.
+            baseOffset = 0.96;
+            hitboxSize = new THREE.Vector3(0.98, 0.84, 0.88);
+        } else if (this.state === FighterState.PUNCHING) {
+            baseOffset = 0.9;
+            hitboxSize = new THREE.Vector3(0.92, 0.82, 0.84);
         }
         const offset = baseOffset * this.facingDirection;
         const yOffset = this.state === FighterState.KICKING ? 0.5 : 1.2;
         this.hitbox.setFromCenterAndSize(
             new THREE.Vector3(this.position.x + offset, this.position.y + yOffset, this.position.z),
-            new THREE.Vector3(0.8, 0.8, 0.8)
+            hitboxSize
         );
     }
 
     checkHit(opponent) {
         if (this.hitbox.intersectsBox(opponent.hurtbox)) {
+            opponent.takeDamage(this.hitboxDamage, this.lastAttackMeta);
+
             if (this.game && typeof this.game.onHitImpact === 'function') {
                 const hitCenter = new THREE.Vector3();
                 const hurtCenter = new THREE.Vector3();
                 this.hitbox.getCenter(hitCenter);
                 opponent.hurtbox.getCenter(hurtCenter);
                 const impactPoint = hitCenter.lerp(hurtCenter, 0.5);
-                this.game.onHitImpact(impactPoint, this.lastAttackMeta);
+                this.game.onHitImpact(impactPoint, this.lastAttackMeta, this, opponent);
             }
-            opponent.takeDamage(this.hitboxDamage, this.lastAttackMeta);
             this.hitboxActive = false;
         }
     }
@@ -503,24 +867,45 @@ export class Fighter extends THREE.Group {
         };
     }
 
-    jump(useLongJump = false) {
+    jump() {
+        if (this.controlLockTimer > 0) return;
         if (this.isGrounded && this.state !== FighterState.HIT) {
+            this.setYzStepSoundPlaying(false);
+            this.setYzStepPlaybackRate(1);
+            this.playRandomYoungZealousJumpSound();
             if (this.config.id === 'young_zealous') {
-                this.velocity.y = useLongJump ? CONFIG.FIGHTER.JUMP_FORCE * 1.1 : CONFIG.FIGHTER.JUMP_FORCE * 0.92;
+                this.velocity.y = CONFIG.FIGHTER.JUMP_FORCE;
             } else {
                 this.velocity.y = CONFIG.FIGHTER.JUMP_FORCE;
             }
             this.isGrounded = false;
             this.state = FighterState.JUMPING;
             if (this.mixer) {
-                const jumpAnimSpeed = this.config.id === 'young_zealous' ? 1.08 : 1;
-                const jumpTrimStart = this.config.id === 'young_zealous' ? 0.08 : 0;
-                const jumpTrimEnd = this.config.id === 'young_zealous' ? 0.82 : 1;
                 const jumpClip = this.config.id === 'young_zealous'
-                    ? (useLongJump && this.animations.LONG_JUMP ? 'LONG_JUMP' : (this.animations.SHORT_JUMP ? 'SHORT_JUMP' : 'JUMP'))
+                    ? (this.animations.JUMP ? 'JUMP' : (this.animations.LONG_JUMP ? 'LONG_JUMP' : (this.animations.SHORT_JUMP ? 'SHORT_JUMP' : 'IDLE')))
                     : 'JUMP';
-                this.playAnimation(jumpClip, 0.1, false, jumpAnimSpeed, jumpTrimStart, jumpTrimEnd);
+                this.playPhysicsSyncedJumpAnimation(jumpClip);
             }
+        }
+    }
+
+    playPhysicsSyncedJumpAnimation(jumpClipName) {
+        if (!this.mixer || !this.animations[jumpClipName]) return;
+
+        const jumpClip = this.animations[jumpClipName];
+        const clipDuration = jumpClip.duration;
+        const gravity = 9.81;
+        const jumpHeight = 1.8;
+        const fallTime = Math.sqrt((2 * jumpHeight) / gravity);
+        const syncSpeed = clipDuration / fallTime;
+        const newSpeed = THREE.MathUtils.clamp(syncSpeed * 0.5, 0.35, 0.6);
+
+        // Sync the clip length to physical airtime, then hold final pose until landing.
+        this.mixer.timeScale = newSpeed;
+        this.playAnimation(jumpClipName, 0.08, false, 1, 0, 1);
+        if (this.currentAction) {
+            this.currentAction.setLoop(THREE.LoopOnce, 1);
+            this.currentAction.clampWhenFinished = true;
         }
     }
 
@@ -530,6 +915,10 @@ export class Fighter extends THREE.Group {
         this.koEndsRound = endsRound;
         this.hitboxActive = false;
         this.velocity.set(0, 0, 0);
+        this.setYzStepSoundPlaying(false);
+
+        const launchMs = Math.max(600, (this.animations.KO_LAUNCH?.duration || 0.6) * 1000);
+        const getupMs = (this.animations.GETUP?.duration || 0.8) * 1000;
 
         if (this.mixer && this.animations.KO_LAUNCH) {
             this.playAnimation('KO_LAUNCH', 0.05, false, 1);
@@ -543,33 +932,52 @@ export class Fighter extends THREE.Group {
             if (this.game && typeof this.game.playHitAudio === 'function') {
                 this.game.playHitAudio();
             }
-        }, 600);
+        }, launchMs);
 
-        setTimeout(() => {
-            if (this.koEndsRound) {
-                this.state = FighterState.DEAD;
-            } else {
+        if (!this.koEndsRound && this.mixer && this.animations.GETUP) {
+            setTimeout(() => {
+                this.playAnimation('GETUP', 0.08, false, 1);
+            }, launchMs + 420);
+
+            setTimeout(() => {
                 this.state = FighterState.IDLE;
+                this.isKOSequenceActive = false;
                 if (this.mixer) this.playAnimation('IDLE', 0.08, true);
-            }
-            this.isKOSequenceActive = false;
-            if (this.koEndsRound && this.game && typeof this.game.onFighterKnockedOut === 'function') {
-                this.game.onFighterKnockedOut(this);
-            }
-        }, 1000);
+            }, launchMs + 420 + getupMs);
+        } else {
+            setTimeout(() => {
+                this.state = FighterState.DEAD;
+                this.isKOSequenceActive = false;
+                if (this.game && typeof this.game.onFighterKnockedOut === 'function') {
+                    this.game.onFighterKnockedOut(this);
+                }
+            }, launchMs + 420);
+        }
     }
 
     move(dir, forceCrouchWalk = false) {
+        if (this.controlLockTimer > 0) return;
         if ([FighterState.IDLE, FighterState.WALK, FighterState.JUMPING].includes(this.state)) {
-            this.position.x += dir * CONFIG.FIGHTER.WALK_SPEED;
+            this.lastMoveDir = dir;
+            const speedScale = this.config.id === 'young_zealous' && dir !== this.facingDirection ? 0.72 : 1;
+            this.position.x += dir * CONFIG.FIGHTER.WALK_SPEED * speedScale;
             if (this.isGrounded) {
+                const isBackward = this.config.id === 'young_zealous' && dir !== this.facingDirection;
+                this.setYzStepPlaybackRate(isBackward ? 0.74 : 1);
+                this.setYzStepSoundPlaying(true);
                 const wasWalking = this.state === FighterState.WALK;
                 this.state = FighterState.WALK;
                 if (this.mixer && this.config.id === 'young_zealous') {
-                    const moveAnim = forceCrouchWalk ? 'CROUCH_WALK' : 'RUN';
+                    const isForward = dir === this.facingDirection;
+                    const moveAnim = forceCrouchWalk
+                        ? 'CROUCH_WALK'
+                        : (isForward
+                            ? (this.animations.DWARF_WALK ? 'DWARF_WALK' : 'RUN')
+                            : (this.animations.BACK_WALK ? 'BACK_WALK' : 'RUN'));
                     const activeName = this.currentAction ? this.currentAction.getClip().name : '';
                     if (activeName !== moveAnim && this.animations[moveAnim]) {
-                        this.playAnimation(moveAnim, 0.08, true);
+                        const moveSpeed = moveAnim === 'BACK_WALK' ? 0.72 : 1;
+                        this.playAnimation(moveAnim, 0.08, true, moveSpeed);
                     }
                 } else if (this.mixer && !wasWalking) {
                     this.playAnimation('IDLE');
@@ -579,6 +987,9 @@ export class Fighter extends THREE.Group {
     }
 
     stop() {
+        this.lastMoveDir = 0;
+        this.setYzStepPlaybackRate(1);
+        this.setYzStepSoundPlaying(false);
         if (this.state === FighterState.WALK) {
             this.state = FighterState.IDLE;
             if (this.mixer) this.playAnimation('IDLE');
@@ -586,12 +997,17 @@ export class Fighter extends THREE.Group {
     }
 
     block(isBlocking) {
+        if (this.controlLockTimer > 0) return;
         if (this.state === FighterState.DEAD || this.state === FighterState.HIT) return;
         
         if (isBlocking && this.isGrounded) {
+            this.setYzStepSoundPlaying(false);
             if (this.state !== FighterState.BLOCKING) {
                 this.state = FighterState.BLOCKING;
-                if (this.mixer) this.playAnimation('BLOCK');
+                if (this.mixer) {
+                    if (this.config.id === 'young_zealous') this.freezeYoungZealousBlockAtLastFrame();
+                    else this.playAnimation('BLOCK');
+                }
             }
         } else if (this.state === FighterState.BLOCKING) {
             this.state = FighterState.IDLE;
@@ -600,23 +1016,27 @@ export class Fighter extends THREE.Group {
     }
 
     punch(isUppercut = false) {
+        if (this.controlLockTimer > 0) return;
         if (this.state === FighterState.PUNCHING || this.state === FighterState.KICKING || this.state === FighterState.HIT) return;
+        this.setYzStepSoundPlaying(false);
         
         const now = Date.now();
         let anim = 'PUNCH_R';
-        let damage = 10;
+        let damage = 5;
         let duration = 400;
-        let hitboxStart = 100;
+        let hitboxStart = 140;
+        let hitboxActiveMs = 110;
         let punchAnimSpeed = 1;
 
         if (isUppercut) {
             anim = 'UPPERCUT';
-            damage = 15;
+            damage = 5;
             duration = 600;
-            hitboxStart = 140;
+            hitboxStart = 210;
+            hitboxActiveMs = 140;
         } else if (now - this.lastPunchTime < 400) {
             anim = 'PUNCH_L';
-            damage = 12;
+            damage = 5;
             this.lastPunchTime = 0;
         } else {
             this.lastPunchTime = now;
@@ -625,7 +1045,11 @@ export class Fighter extends THREE.Group {
         if (this.config.id === 'young_zealous') {
             punchAnimSpeed = isUppercut ? 1.3 : 1.55;
             duration = Math.round(duration * 0.72);
-            hitboxStart = Math.round(hitboxStart * 0.7);
+            hitboxStart = Math.round(hitboxStart * 0.88);
+            hitboxActiveMs = Math.round(hitboxActiveMs * 0.9);
+        } else if (this.config.id === 'blue_fighter') {
+            hitboxStart = Math.round(hitboxStart * 0.84);
+            hitboxActiveMs = Math.round(hitboxActiveMs * 1.2);
         }
 
         this.state = FighterState.PUNCHING;
@@ -635,8 +1059,8 @@ export class Fighter extends THREE.Group {
             heavy: isUppercut
         };
         if (this.mixer) this.playAnimation(anim, 0.05, false, punchAnimSpeed);
-        
-        setTimeout(() => this.hitboxActive = true, hitboxStart);
+
+        this.scheduleHitboxWindow(hitboxStart, hitboxActiveMs);
         setTimeout(() => {
             if (this.state === FighterState.PUNCHING) {
                 this.state = FighterState.IDLE;
@@ -647,7 +1071,9 @@ export class Fighter extends THREE.Group {
     }
 
     kick(type = 'SIDEKICK') {
+        if (this.controlLockTimer > 0) return;
         if (this.state === FighterState.PUNCHING || this.state === FighterState.KICKING || this.state === FighterState.HIT) return;
+        this.setYzStepSoundPlaying(false);
         
         this.state = FighterState.KICKING;
         this.hitboxDamage = type === 'SPINKICK' ? 20 : (type === 'LOWKICK' ? 8 : 12);
@@ -657,17 +1083,19 @@ export class Fighter extends THREE.Group {
         };
         let kickAnimSpeed = 1;
         let duration = type === 'SPINKICK' ? 800 : 500;
-        let hitboxStart = 150;
+        let hitboxStart = type === 'SPINKICK' ? 260 : (type === 'LOWKICK' ? 170 : 190);
+        let hitboxActiveMs = type === 'SPINKICK' ? 170 : 130;
 
         if (this.config.id === 'young_zealous') {
             kickAnimSpeed = type === 'SPINKICK' ? 1.25 : 1.4;
             duration = Math.round(duration * 0.74);
-            hitboxStart = Math.round(hitboxStart * 0.75);
+            hitboxStart = Math.round(hitboxStart * 0.88);
+            hitboxActiveMs = Math.round(hitboxActiveMs * 0.9);
         }
 
         if (this.mixer) this.playAnimation(type, 0.05, false, kickAnimSpeed);
-        
-        setTimeout(() => this.hitboxActive = true, hitboxStart);
+
+        this.scheduleHitboxWindow(hitboxStart, hitboxActiveMs);
         setTimeout(() => {
             if (this.state === FighterState.KICKING) {
                 this.state = FighterState.IDLE;
@@ -678,11 +1106,18 @@ export class Fighter extends THREE.Group {
     }
 
     takeDamage(amount, attackMeta = { heavy: false, move: '' }) {
+        this.setYzStepSoundPlaying(false);
         if (this.state === FighterState.BLOCKING) {
             amount *= 0.1;
+            this.playNextYoungZealousBlockSound();
+            this.playYoungZealousBlockHitReact();
+            if (this.game && typeof this.game.onBlockImpact === 'function') {
+                const blockPoint = new THREE.Vector3(this.position.x + this.facingDirection * 0.35, this.position.y + 1.0, this.position.z);
+                this.game.onBlockImpact(blockPoint, attackMeta, this);
+            }
         } else {
             this.comboHits += 1;
-            this.comboWindow = 1.6;
+            this.comboWindow = 0.9;
 
             const projectedHealth = this.health - amount;
             const comboKnockdown = this.comboHits >= 8 && projectedHealth < 40;
@@ -698,7 +1133,8 @@ export class Fighter extends THREE.Group {
                 this.comboWindow = 0;
                 this.playKOSequence(fatalKO);
             } else {
-                if (this.mixer) this.playAnimation('HIT', 0.05, false);
+                const hitAnim = this.config.id === 'young_zealous' && this.animations.HIT_REACT ? 'HIT_REACT' : 'HIT';
+                if (this.mixer) this.playAnimation(hitAnim, 0.05, false);
                 setTimeout(() => {
                     if (this.state === FighterState.HIT) {
                         this.state = FighterState.IDLE;
